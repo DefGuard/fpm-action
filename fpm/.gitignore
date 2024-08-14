@@ -1,0 +1,47 @@
+# vim
+.*.sw[a-z]
+
+# emacs
+\#*#
+*~
+.#*
+
+# package builds
+*.rpm
+*.deb
+*.pkg.tar*
+
+# build byproducts
+build-*/*
+fpm.wiki
+*.gem
+*.pkg
+
+# python
+*.pyc
+*.egg-info
+
+# RVM
+.rvmrc
+.ruby-gemset
+.ruby-version
+
+.yardoc
+coverage
+test/tmp
+Gemfile.lock
+
+# OS X
+.DS_Store
+
+.rbx
+.vagrant
+
+# RubyMine
+.idea/
+
+docs/_build
+docs/.work
+
+.docker-test-everything
+.docker-test-minimal

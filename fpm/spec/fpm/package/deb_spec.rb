@@ -1,0 +1,588 @@
+require "spec_setup"
+require 'fileutils'
+require "fpm" # local
+require "fpm/package/deb" # local
+require "fpm/package/dir" # local
+require "stud/temporary"
+require "English" # for $CHILD_STATUS
+
+describe FPM::Package::Deb do
+  # dpkg-deb lets us query deb package files.
+  # Comes with debian and ubuntu systems.
+  have_dpkg_deb = program_exists?("dpkg-deb")
+  if !have_dpkg_deb
+    Cabin::Channel.get("rspec") \
+      .warn("Skipping some deb tests because 'dpkg-deb' isn't in your PATH")
+  end
+
+  have_lintian = program_exists?("lintian")
+  if !have_lintian
+    Cabin::Channel.get("rspec") \
+      .warn("Skipping some deb tests because 'lintian' isn't in your PATH")
+  end
+
+  let(:target) { Stud::Temporary.pathname + ".deb" }
+  after do
+    subject.cleanup
+    File.unlink(target) if File.exist?(target)
+  end
+
+  describe "#architecture" do
+    it "should convert x86_64 to amd64" do
+      subject.architecture = "x86_64"
+      expect(subject.architecture).to(be == "amd64")
+    end
+
+    it "should convert aarch64 to arm64" do
+      subject.architecture = "aarch64"
+      expect(subject.architecture).to(be == "arm64")
+    end
+
+    it "should convert noarch to all" do
+      subject.architecture = "noarch"
+      expect(subject.architecture).to(be == "all")
+    end
+
+    let(:native) do
+      if program_exists?("dpkg")
+        `dpkg --print-architecture`.chomp
+      else
+        `uname -m`.chomp
+      end
+    end
+
+    it "should default to native" do
+      # Convert kernel name to debian name
+      expected = if native == "x86_64"
+        "amd64"
+      elsif native == "aarch64"
+        "arm64"
+      else
+        native
+      end
+      expect(subject.architecture).to(be == expected)
+    end
+  end
+
+  describe "#iteration" do
+    it "should default to nil" do
+      expect(subject.iteration).to(be_nil)
+    end
+  end
+
+  describe "#epoch" do
+    it "should default to nil" do
+      expect(subject.epoch).to(be_nil)
+    end
+  end
+
+  describe "priority" do
+    it "should default to 'optional'" do
+      expect(subject.attributes[:deb_priority]).to(be == "optional")
+    end
+  end
+
+  describe "use-file-permissions" do
+    it "should be nil by default" do
+      expect(subject.attributes[:deb_use_file_permissions?]).to(be_nil)
+    end
+  end
+
+  describe "#to_s" do
+    before do
+      subject.name = "name"
+      subject.version = "123"
+      subject.architecture = "all"
+      subject.iteration = "100"
+      subject.epoch = "5"
+    end
+
+    it "should have a default output usable as a filename" do
+      # This is the default filename I see commonly produced by debuild
+      insist { subject.to_s } == "name_123-100_all.deb"
+    end
+
+    context "when iteration is nil" do
+      before do
+        subject.iteration = nil
+      end
+
+      it "should not include iteration if it is nil" do
+        # This is the default filename I see commonly produced by debuild
+        expect(subject.to_s).to(be == "name_123_all.deb")
+      end
+    end
+  end
+
+  context "supporting debian policy hacks" do
+    before do
+      subject.name = "Capitalized_Name_With_Underscores"
+    end
+
+    it "should lowercase the package name" do
+      expect(subject.name).to(be == subject.name.downcase)
+    end
+
+    it "should replace underscores with dashes in the package name" do
+      expect(subject.name).not_to(be_include("_"))
+    end
+
+    it "should replace spaces with dashes in the package name" do
+      expect(subject.name).not_to(be_include(" "))
+    end
+  end
+
+  context "when validating the version field" do
+    [ "_", "1_2", "abc def", "%", "1^a"].each do |v|
+      it "should reject as invalid, '#{v}'" do
+        subject.version = v
+        insist { subject.version }.raises FPM::InvalidPackageConfiguration
+      end
+    end
+
+    [ "1", "1.2", "1.2.3", "20200101", "1~beta", "1whatever"].each do |v|
+      it "should accept '#{v}'" do
+        subject.version = v
+
+        # should not raise exception
+        insist { subject.version } == v
+      end
+
+      it "should remove a leading 'v' from v#{v} and still accept it" do
+        subject.version = "v#{v}"
+
+        # should not raise exception
+        insist { subject.version } == v
+      end
+    end
+  end
+
+  describe "#output" do
+    let(:original) { FPM::Package::Deb.new }
+    let(:input) { FPM::Package::Deb.new }
+
+    before do
+      # output a package, use it as the input, set the subject to that input
+      # package. This helps ensure that we can write and read packages
+      # properly.
+      # The target file must not exist.
+
+      original.name = "name"
+      original.version = "123"
+      original.iteration = "100"
+      original.epoch = "5"
+      original.architecture = "all"
+      original.dependencies << "something > 10"
+      original.dependencies << "hello >= 20"
+      original.provides << "#{original.name} (= #{original.version})"
+
+      # Test to cover PR#591 (fix provides names)
+      original.provides << "Some-SILLY_name"
+
+      original.conflicts = ["foo < 123"]
+      original.replaces  = ["package < 1.2.3"]
+      original.attributes[:deb_breaks] = ["baz < 123"]
+
+      original.attributes[:deb_build_depends_given?] = true
+      original.attributes[:deb_build_depends] ||= []
+      original.attributes[:deb_build_depends] << 'something-else > 0.0.0'
+      original.attributes[:deb_build_depends] << 'something-else < 1.0.0'
+
+      original.attributes[:deb_priority] = "fizzle"
+      original.attributes[:deb_field_given?] = true
+      original.attributes[:deb_field] = { "foo" => "bar" }
+
+      original.attributes[:deb_meta_file] = %w(meta_test triggers).map do |fn|
+        File.expand_path("../../../fixtures/deb/#{fn}", __FILE__)
+      end
+
+      original.attributes[:deb_interest] = ['asdf', 'hjkl']
+      original.attributes[:deb_activate] = ['qwer', 'uiop']
+      original.attributes[:deb_interest_noawait] = ['aqwx', 'zsxc']
+      original.attributes[:deb_activate_noawait] = ['edcv', 'rfvb']
+
+      original.output(target)
+      input.input(target)
+    end
+
+    after do
+      original.cleanup
+      input.cleanup
+    end # after
+
+    context "when the deb's control section is extracted" do
+      let(:control_dir) { Stud::Temporary.directory }
+      before do
+        system(ar_cmd[0] + " p '#{target}' control.tar.gz | tar -zx -C '#{control_dir}' -f -")
+        raise "couldn't extract test deb" unless $CHILD_STATUS.success?
+      end
+
+      it "should have the requested meta file in the control archive" do
+        File.open(File.join(control_dir, 'meta_test')) do |f|
+          insist { f.read.chomp } == "asdf"
+        end
+      end
+
+      it "should have the requested triggers in the triggers file" do
+        triggers = File.open(File.join(control_dir, 'triggers')) do |f|
+          f.read
+        end
+        reject { triggers =~ /^interest from-meta-file$/ }.nil?
+        reject { triggers =~ /^interest asdf$/ }.nil?
+        reject { triggers =~ /^interest hjkl$/ }.nil?
+        reject { triggers =~ /^activate qwer$/ }.nil?
+        reject { triggers =~ /^activate uiop$/ }.nil?
+        reject { triggers =~ /^interest-noawait aqwx$/ }.nil?
+        reject { triggers =~ /^interest-noawait zsxc$/ }.nil?
+        reject { triggers =~ /^activate-noawait edcv$/ }.nil?
+        reject { triggers =~ /^activate-noawait rfvb$/ }.nil?
+        insist { triggers[-1] } == "\n"
+      end
+
+      after do
+        FileUtils.rm_rf(control_dir)
+      end
+    end
+
+    context "package attributes" do
+      it "should have the correct name" do
+        insist { input.name } == original.name
+      end
+
+      it "should have the correct version" do
+        insist { input.version } == original.version
+      end
+
+      it "should have the correct iteration" do
+        insist { input.iteration } == original.iteration
+      end
+
+      it "should have the correct epoch" do
+        insist { input.epoch } == original.epoch
+      end
+
+      it "should have the correct dependencies" do
+        original.dependencies.each do |dep|
+          insist { input.dependencies }.include?(dep)
+        end
+      end
+
+      it "should fix capitalization and underscores-to-dashes (#591)" do
+        insist { input.provides }.include?("some-silly-name")
+      end
+    end # package attributes
+
+    # This section mainly just verifies that 'dpkg-deb' can parse the package.
+    context "when read with dpkg" do
+      before do
+        skip("Missing dpkg-deb program") unless have_dpkg_deb
+      end
+
+      def dpkg_field(field)
+        return `dpkg-deb -f #{target} #{field}`.chomp
+      end # def dpkg_field
+
+      it "should have the correct name" do
+        insist { dpkg_field("Package") } == original.name
+      end
+
+      it "should have the correct 'epoch:version-iteration'" do
+        insist { dpkg_field("Version") } == original.to_s("EPOCH:VERSION-ITERATION")
+      end
+
+      it "should have the correct priority" do
+        insist { dpkg_field("Priority") } == original.attributes[:deb_priority]
+      end
+
+      it "should have the correct dependency list" do
+        # 'something > 10' should convert to 'something (>> 10)', etc.
+        insist { dpkg_field("Depends") } == "something (>> 10), hello (>= 20)"
+      end
+
+      it "should have the correct replaces list" do
+        # 'package < 1.2.3' should convert to 'package (<< 1.2.3)'
+        insist { dpkg_field("Replaces") } == "package (<< 1.2.3)"
+      end
+
+      it "should have the correct build dependency list" do
+        insist { dpkg_field("Build-Depends") } == "something-else (>> 0.0.0), something-else (<< 1.0.0)"
+      end
+
+      it "should have a custom field 'foo: bar'" do
+        insist { dpkg_field("foo") } == "bar"
+      end
+
+      it "should have the correct Conflicts" do
+        insist { dpkg_field("Conflicts") } == "foo (<< 123)"
+      end
+
+      it "should have the correct Breaks" do
+        insist { dpkg_field("Breaks") } == "baz (<< 123)"
+      end
+    end
+  end # #output
+
+  describe "#output with no depends" do
+    let(:original) { FPM::Package::Deb.new }
+    let(:input) { FPM::Package::Deb.new }
+
+    before do
+      # output a package, use it as the input, set the subject to that input
+      # package. This helps ensure that we can write and read packages
+      # properly.
+
+      original.name = "name"
+      original.version = "123"
+      original.iteration = "100"
+      original.epoch = "5"
+      original.architecture = "all"
+      original.dependencies << "something > 10"
+      original.dependencies << "hello >= 20"
+      original.attributes[:no_depends?] = true
+      original.output(target)
+      input.input(target)
+    end
+
+    after do
+      original.cleanup
+      input.cleanup
+    end # after
+
+    it "should have no dependencies" do
+      insist { input.dependencies }.empty?
+    end
+  end # #output with no dependencies
+
+  describe "#tar_flags" do
+    let(:package) { FPM::Package::Deb.new }
+
+    before :each do
+      package.name = "name"
+    end
+
+    after :each do
+      package.cleanup
+    end # after
+
+    it "should set the user for the package's data files" do
+      package.attributes[:deb_user] = "nobody"
+      # output a package so that @data_tar_flags is computed
+      expect(package.data_tar_flags).to(be == ["--owner", "nobody", "--numeric-owner", "--group", "0"])
+    end
+
+    it "should set the group for the package's data files" do
+      package.attributes[:deb_group] = "nogroup"
+      # output a package so that @data_tar_flags is computed
+      expect(package.data_tar_flags).to(be == ["--numeric-owner", "--owner", "0", "--group", "nogroup"])
+    end
+
+    it "should not set the user or group for the package's data files if :deb_use_file_permissions? is not nil" do
+      package.attributes[:deb_use_file_permissions?] = true
+      # output a package so that @data_tar_flags is computed
+      package.output(target)
+      expect(package.data_tar_flags).to(be == [])
+    end
+  end # #tar_flags
+
+  describe "#output with lintian" do
+    let(:staging_path) { Stud::Temporary.directory }
+    before do
+      # TODO(sissel): Refactor this to use factory pattern instead of fixture?
+      FileUtils.cp_r(Dir['spec/fixtures/deb/staging/*'], staging_path)
+      ['/etc', '/etc/init.d', '/etc/init.d/test'].each do |f|
+        File.chmod(0755, File.join(staging_path, f)) # cp_r may mess-up with attributes
+      end
+
+      subject.name = "name"
+      subject.version = "0.0.1"
+      subject.maintainer = "Jordan Sissel <jls@semicomplete.com>"
+      subject.description = "Test package\nExtended description."
+      subject.attributes[:deb_user] = "root"
+      subject.attributes[:deb_group] = "root"
+      subject.category = "comm"
+      subject.dependencies << "lsb-base"
+
+      subject.instance_variable_set(:@staging_path, staging_path)
+
+      subject.output(target)
+    end
+
+    after do
+      FileUtils.rm_r staging_path if File.exist? staging_path
+    end # after
+
+    context "when run against lintian" do
+      before do
+        skip("Missing lintian program") unless have_lintian 
+      end
+
+      lintian_errors_to_ignore = [
+        "no-copyright-file",
+        "script-in-etc-init.d-not-registered-via-update-rc.d"
+      ]
+
+      it "should return no errors" do
+        lintian_output = `lintian #{target} --suppress-tags '#{lintian_errors_to_ignore.join(",")}'`
+        expect($CHILD_STATUS).to eq(0), lintian_output
+      end
+    end
+  end
+
+  describe "#output with Provides values" do
+    let(:original) { FPM::Package::Deb.new }
+
+    before do
+      # output a package, use it as the input, set the subject to that input
+      # package. This helps ensure that we can write and read packages
+      # properly.
+
+      original.name = "name"
+      original.version = "123"
+    end
+
+    after do
+      original.cleanup
+    end # after
+
+    invalid = [
+      "this is not valid",
+      "hello = world",
+      "hello ()",
+      "hello (>)",
+      "hello (1234)",
+      "foo (<< 1.0.0-54)"
+    ]
+
+    valid = [
+      "libc",
+      "libc (= 6)",
+      "bar (= 1:1.0)",
+      "bar (= 1:1.0-1)",
+      "foo (= 1.0.0-54)"
+    ]
+
+    invalid.each do |i|
+      it "should reject '#{i}'" do
+        original.provides << i
+
+        insist { original.output(target) }.raises FPM::InvalidPackageConfiguration
+      end
+    end
+
+    valid.each do |i|
+      it "should accept '#{i}'" do
+        original.provides << i
+
+        original.output(target)
+      end
+    end
+  end
+
+  describe "#reproducible" do
+
+    let(:package) {
+       # Turn on reproducible build behavior by setting SOURCE_DATE_EPOCH like user would
+       val = FPM::Package::Deb.new
+       val.attributes[:source_date_epoch] = '1'  # one second into Jan 1 1970 UTC... '0' not supported by zlib binding :-(
+       val
+    }
+
+    before :each do
+      package.name = "name"
+      File.unlink(target + '.orig') if File.exist?(target + '.orig')
+    end
+
+    after :each do
+      package.cleanup
+      File.unlink(target + '.orig') if File.exist?(target + '.orig')
+    end # after
+
+    it "it should output bit-for-bit identical packages" do
+      cmds = []
+      cmds << "ar" if not ar_cmd_deterministic?
+      cmds << "tar" if not tar_cmd_supports_sort_names_and_set_mtime?
+      if not cmds.empty?
+        skip("fpm searched for variants of [#{cmds.join(", ")}] that support(s) deterministic archives, but found none, so can't test reproducibility.")
+        return
+      end
+
+      package.output(target)
+      # FIXME: 2nd and later runs create changelog.Debian.gz?!, so throw away output of 1st run
+      FileUtils.rm(target)
+      package.output(target)
+      FileUtils.mv(target, target + '.orig')
+      # Output a second time with a different timestamp; tar format time resolution is 1 second
+      sleep(1)
+      package.output(target)
+
+      # Show detailed differences, if diffoscope is on PATH; else do nothing
+      tmp = ENV['TMP'] || "/tmp"
+      log = File.join(tmp, "diffoscope.log.tmp")
+      system('diffoscope %s %s > %s 2> /dev/null' % [target, target + '.orig', log])
+      diffoscope_diff_length = File.size(log)
+      if (diffoscope_diff_length > 0)
+         puts("\nDiffoscope reports:")
+         puts(File.read(log))
+      end
+      expect(diffoscope_diff_length).to(be == 0)
+      File.unlink(log)
+
+      expect(FileUtils.compare_file(target, target + '.orig')).to be true
+    end
+  end # #reproducible
+
+  describe "compression" do
+    {
+      "bzip2" => "bz2",
+      "xz" => "xz",
+      "gz" => "gz"
+    }.each do |flag,suffix|
+      context "when --deb-compression is #{flag}" do
+        let(:target) { Stud::Temporary.pathname + ".deb" }
+        after do
+          subject.cleanup
+          File.unlink(target) if File.exist?(target)
+        end
+
+        before do
+          deb = FPM::Package::Deb.new
+          deb.name = "name"
+          deb.attributes[:deb_compression] = flag
+          deb.output(target)
+        end
+
+        control_suffix = case flag
+          when 'bzip2'
+            'gz'
+          else
+            suffix
+        end
+
+        it "should use #{suffix} for data file and #{control_suffix} for control file" do
+          list = `ar t #{target}`.split("\n")
+          insist { list }.include?("control.tar.#{control_suffix}")
+          insist { list }.include?("data.tar.#{suffix}")
+        end
+
+        # For issue #1840, PR #1841
+        # fpm should generate deb packages that do not cause lintian to crash
+        it "should not cause lintian to crash" do
+          skip("Missing lintian program") unless have_lintian
+
+          # Have lintian run with only one check. The goal here is to check if
+          # lintian crashes or not. This 'symlinks' check would normaly check
+          # for broken symlinks. Since this package has no files, this check
+          # should always succeed. It would fail if fpm generated any invalid
+          # packages, such as ones with a bzip2-compressed control.tar file (#1840)
+          #
+          # Note: At some point, Debian renamed the "symlinks" check to "files/symbolic-links/broken"
+          # In order to support both newer and older Debian derivatives, the test suite will try both checks,
+          # and if both fail, we should know something is wrong with the package.
+          insist {
+            system("lintian", "-C", "symlinks", target) || system("lintian", "-C", "files/symbolic-links/broken", target)
+          } == true
+        end
+      end
+    end
+  end
+end # describe FPM::Package::Deb
