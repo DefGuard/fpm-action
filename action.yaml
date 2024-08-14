@@ -1,0 +1,17 @@
+name: 'fpm-action'
+description: 'Build packages using github.com/jordansissel/fpm'
+branding:
+  icon: 'package'  
+  color: 'green'
+inputs:
+  fpm_opts:
+    description: 'Options passed to the fpm cli tool'
+    required: true
+  fpm_args:
+    description: 'Arguments passed to the fpm cli tool'
+    required: true
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.fpm_args }}
