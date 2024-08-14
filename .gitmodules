@@ -1,3 +1,0 @@
-[submodule "fpm"]
-	path = fpm
-	url = https://github.com/TwitchCaptain/fpm.git
